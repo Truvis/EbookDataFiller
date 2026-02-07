@@ -1,4 +1,4 @@
-# 📚 Ebook Metadata Pipeline
+# 📚 Ebook Metadata Filler
 
 A comprehensive metadata extraction, enrichment, writing, and renaming tool for large ebook collections. Processes `.epub`, `.pdf`, `.mobi`, `.azw`, `.azw3`, `.fb2`, and many more formats through a multi-stage pipeline that pulls from free catalogs, public APIs, and AI analysis to build rich, complete metadata — then writes it back into files and renames them cleanly.
 
