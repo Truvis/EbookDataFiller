@@ -1,4 +1,4 @@
-# 📚 Ebook Metadata Filler
+# 📚 Ebook Metadata Pipeline
 
 A comprehensive metadata extraction, enrichment, writing, and renaming tool for large ebook collections. Processes `.epub`, `.pdf`, `.mobi`, `.azw`, `.azw3`, `.fb2`, and many more formats through a multi-stage pipeline that pulls from free catalogs, public APIs, and AI analysis to build rich, complete metadata — then writes it back into files and renames them cleanly.
 
@@ -486,6 +486,262 @@ python3 do.py /data/ebooks --limit 10 --dry-run --verbose
 
 ---
 
+## Configuration File
+
+The pipeline supports a YAML config file that acts as persistent defaults for all CLI flags. CLI flags always override the config file, so you can set your normal workflow in the config and use flags for one-off tweaks.
+
+### Config file search order
+
+1. `--config <path>` (explicit)
+2. `./ebook_pipeline.yaml` (current directory)
+3. `<ebook_dir>/ebook_pipeline.yaml` (alongside your ebooks)
+4. `~/.config/ebook-pipeline/config.yaml` (user config)
+5. `/etc/ebook-pipeline/config.yaml` (system config)
+
+### Priority
+
+```
+CLI flags  >  Environment variables  >  Config file  >  Built-in defaults
+```
+
+### Generate a default config
+
+```bash
+cp ebook_pipeline.yaml ~/.config/ebook-pipeline/config.yaml
+```
+
+### Example config
+
+```yaml
+# Directories
+ebook_dir: "/mnt/data/ebooks"
+rdf_catalog: "~/gutenberg-rdf"
+
+# API keys (prefer env vars for security)
+anthropic_api_key: null              # use ANTHROPIC_API_KEY env var
+google_api_key: null                 # use GOOGLE_API_KEY env var
+
+# Pipeline stages
+skip_rdf: false
+skip_api: false
+skip_ai: false
+skip_write: false
+skip_rename: false
+
+# Thresholds
+api_threshold: 0.7                   # skip API if completeness >= 70%
+ai_threshold: 0.4                    # skip AI if completeness >= 40%
+
+# Processing
+dry_run: false
+verbose: false
+limit: null                          # null = process all files
+
+# Rate limiting
+rate_limits:
+  openlibrary:
+    delay: 0.5
+    circuit_breaker: 5
+  google_books:
+    delay: 1.5
+    circuit_breaker: 5
+  anthropic:
+    delay: 1.0
+    daily_limit: 500                 # cost control
+  global:
+    files_per_minute: null           # no limit
+    pause_between_files: 0           # seconds between each file
+
+# Scheduling
+schedule:
+  enabled: false
+  calendar: "*-*-* 02:00:00"         # daily at 2 AM
+  max_runtime_minutes: 240
+```
+
+### Config + CLI interaction
+
+```bash
+# Config says verbose: false, but override for this run
+python ebook_metadata_pipeline.py --verbose
+
+# Config says limit: null, but test with 5 files
+python ebook_metadata_pipeline.py --limit 5 --dry-run
+
+# Config says ebook_dir: /mnt/data/ebooks, but process a different dir
+python ebook_metadata_pipeline.py /other/path
+
+# Use a specific config file
+python ebook_metadata_pipeline.py --config /path/to/my-config.yaml
+```
+
+---
+
+## Rate Limiting
+
+The pipeline includes configurable rate limiting at two levels: per-API and global file processing speed.
+
+### Per-API Rate Limiting
+
+Each external API has independent controls:
+
+| Setting | OpenLibrary | Google Books | Anthropic | Description |
+|---------|:-----------:|:------------:|:---------:|-------------|
+| `delay` | 0.5s | 1.5s | 1.0s | Minimum time between requests |
+| `max_retries` | 3 | 3 | 2 | Retry count on 429/timeout |
+| `backoff_base` | 2.0 | 2.0 | 3.0 | Exponential backoff multiplier |
+| `circuit_breaker` | 5 | 5 | 3 | Disable after N consecutive 429s |
+| `daily_limit` | — | — | — | Max requests per day |
+
+When an API returns `429 Too Many Requests`, the pipeline automatically backs off exponentially. After N consecutive 429s (the `circuit_breaker` threshold), the API is disabled for the rest of the run and the pipeline falls back to other sources.
+
+### Global File Throttling
+
+Control how fast the pipeline processes files overall:
+
+```yaml
+rate_limits:
+  global:
+    files_per_minute: 30             # process max 30 files/min
+    files_per_hour: 1000             # hard cap per hour
+    pause_between_files: 0.5         # 500ms pause between each file
+```
+
+This is useful when running against a shared filesystem or when you want to limit CPU/IO impact on a production server.
+
+### CLI rate override
+
+```bash
+# Quick override for testing
+python ebook_metadata_pipeline.py --rate-delay 2.0 --files-per-minute 10
+```
+
+### Cost control for AI
+
+Set a daily limit on Anthropic API calls to control costs:
+
+```yaml
+rate_limits:
+  anthropic:
+    daily_limit: 200                 # max 200 AI calls per day
+```
+
+---
+
+## Automation
+
+The pipeline can be automated via **systemd timer** (preferred on Linux) or **cron**. A service installer script handles the setup.
+
+### Quick setup (systemd user service)
+
+```bash
+# Install as a user service (no sudo needed)
+python ebook_pipeline_service.py install --user --config ebook_pipeline.yaml
+
+# Start the timer
+systemctl --user start ebook-pipeline.timer
+
+# Check it's running
+systemctl --user list-timers
+```
+
+### System-level service (runs as your user)
+
+```bash
+sudo python ebook_pipeline_service.py install --config ebook_pipeline.yaml
+
+# Start
+sudo systemctl start ebook-pipeline.timer
+sudo systemctl status ebook-pipeline.timer
+```
+
+### Cron alternative
+
+```bash
+# Generate crontab line
+python ebook_pipeline_service.py cron --config ebook_pipeline.yaml
+
+# Output:
+# 0 2 * * * /path/to/ebook_pipeline_run.sh >> /var/log/ebook-pipeline/cron.log 2>&1
+```
+
+### What gets installed
+
+```
+~/.config/systemd/user/
+├── ebook-pipeline.service    # oneshot service unit
+└── ebook-pipeline.timer      # timer (default: daily 2 AM)
+
+~/.config/ebook-pipeline/
+├── config.yaml               # your config (if not already present)
+└── env                       # API keys (chmod 600)
+
+<script_dir>/
+└── ebook_pipeline_run.sh     # wrapper with lock file + env loading
+```
+
+### Schedule configuration
+
+Set the schedule in your config file using [systemd calendar format](https://www.freedesktop.org/software/systemd/man/systemd.time.html):
+
+```yaml
+schedule:
+  calendar: "*-*-* 02:00:00"         # daily at 2 AM
+  # calendar: "Mon *-*-* 02:00:00"   # weekly on Monday
+  # calendar: "*-*-* *:00:00"        # every hour
+  # calendar: "*-*-* 02,14:00:00"    # twice daily
+  max_runtime_minutes: 240            # stop after 4 hours
+  randomized_delay_sec: 300           # jitter to avoid API storms
+```
+
+### Service management commands
+
+```bash
+# Manual trigger
+systemctl --user start ebook-pipeline.service
+
+# View logs
+journalctl --user -u ebook-pipeline -f
+
+# Disable
+systemctl --user stop ebook-pipeline.timer
+systemctl --user disable ebook-pipeline.timer
+
+# Uninstall completely
+python ebook_pipeline_service.py uninstall --user
+```
+
+### Lock file safety
+
+The wrapper script uses a lock file (`/tmp/ebook-pipeline.lock`) to prevent concurrent runs. If the timer fires while a previous run is still going, it exits cleanly. Stale lock files from crashed runs are automatically detected and cleaned up.
+
+### Environment file for API keys
+
+Store API keys securely in `~/.config/ebook-pipeline/env`:
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-...
+GOOGLE_API_KEY=AIza...
+```
+
+This file is loaded by the wrapper before running the pipeline and should be `chmod 600`.
+
+---
+
+## Project Files
+
+| File | Purpose |
+|------|---------|
+| `ebook_metadata_pipeline.py` | Main pipeline script |
+| `ebook_pipeline.yaml` | Configuration template |
+| `ebook_pipeline_config.py` | Config loader + rate limiter |
+| `ebook_pipeline_service.py` | Systemd/cron service installer |
+| `ebook_pipeline_run.sh` | Generated wrapper script (auto-created) |
+| `setup.sh` | One-shot dependency installer |
+| `README.md` | This file |
+
+---
+
 ## Dependencies
 
 | Package | Purpose | Install |
@@ -497,11 +753,12 @@ python3 do.py /data/ebooks --limit 10 --dry-run --verbose
 | `anthropic` | Claude AI API client | `pip install anthropic` |
 | `mobi` | MOBI/AZW extraction | `pip install mobi` |
 | `beautifulsoup4` | HTML text extraction | `pip install beautifulsoup4` |
+| `pyyaml` | Config file parsing | `pip install pyyaml` |
 | **Calibre** | `ebook-meta` CLI for reading/writing metadata | `sudo apt install calibre` |
 
 ```bash
 # Install all Python deps at once
-pip install ebooklib PyMuPDF lxml requests anthropic mobi beautifulsoup4 --break-system-packages
+pip install ebooklib PyMuPDF lxml requests anthropic mobi beautifulsoup4 pyyaml --break-system-packages
 ```
 
 ---
