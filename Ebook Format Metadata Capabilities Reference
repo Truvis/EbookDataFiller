@@ -1,0 +1,325 @@
+# Ebook Format Metadata Capabilities Reference
+
+> Research compiled from: EPUB OPF/Dublin Core spec (IDPF), MOBI EXTH record
+> definitions (MobileRead Wiki + Calibre source `format_docs/pdb/mobi.txt`),
+> KindleUnpack source, PDF XMP/Document Info specs (ISO 16684-1, pikepdf docs),
+> FB2 FictionBook XML spec (FictionBook.org), and Calibre `ebook-meta` tool
+> documentation (v9.2.1). Verified against Go MOBI libraries (766b/mobi,
+> peterbn/mobi) and Python ebookmeta library.
+
+---
+
+## Format-by-Format Breakdown
+
+### EPUB (.epub)
+
+**Spec basis:** OPF 2.0.1 / EPUB Packages 3.2, Dublin Core 1.1 metadata
+
+**Storage mechanism:** XML metadata in `content.opf` inside the EPUB ZIP container.
+Uses `<dc:*>` Dublin Core elements plus `<meta>` for extensions.
+
+| Metadata Field       | DC/OPF Element                         | Writable via Calibre | Round-trips? |
+|----------------------|----------------------------------------|---------------------|-------------|
+| Title                | `<dc:title>`                           | ✅ --title          | ✅          |
+| Authors              | `<dc:creator opf:role="aut">`          | ✅ --authors        | ✅          |
+| Publisher            | `<dc:publisher>`                       | ✅ --publisher      | ✅          |
+| Publication Date     | `<dc:date opf:event="publication">`    | ✅ --date           | ✅          |
+| Language             | `<dc:language>`                        | ✅ --language       | ✅          |
+| Description          | `<dc:description>`                     | ✅ --comments       | ✅          |
+| ISBN                 | `<dc:identifier opf:scheme="ISBN">`    | ✅ --isbn           | ✅          |
+| Other Identifiers    | `<dc:identifier>` + scheme             | ✅ --identifier     | ✅          |
+| Tags/Subjects        | `<dc:subject>`                         | ✅ --tags           | ✅          |
+| Series               | `<meta name="calibre:series">`         | ✅ --series         | ✅          |
+| Series Index         | `<meta name="calibre:series_index">`   | ✅ --index          | ✅          |
+| Cover (embedded)     | `<meta name="cover">` + manifest item  | ✅ --cover          | ✅          |
+| Rating               | `<meta name="calibre:rating">`         | ✅ --rating         | ✅          |
+| Category             | via `<meta>` or custom                 | ✅ --category       | ⚠️ varies   |
+| Book Producer        | `<dc:contributor opf:role="bkp">`      | ✅ --book-producer  | ✅          |
+| Rights               | `<dc:rights>`                          | read only           | read only   |
+| Original Date        | no standard field                      | ❌                  | ❌          |
+| LCC/DDC              | no standard field                      | ❌                  | ❌          |
+| Page Count           | no standard field (viewer-dependent)   | ❌                  | ❌          |
+| Genres (as distinct) | no standard field (use dc:subject)     | ❌ (use tags)       | ❌          |
+
+**Notes:**
+- Required fields: identifier, title, language (EPUB2); + modified date (EPUB3)
+- EPUB3 uses `<meta property="dcterms:modified">` instead of `opf:event`
+- Calibre stores series/rating in custom `<meta>` — not part of DC spec but widely used
+- The `<dc:subject>` element maps to both "tags" and "subjects" conceptually
+- Custom `<meta>` elements can store arbitrary key/value metadata
+- Multiple identifiers supported: ISBN, DOI, URI, custom schemes
+
+---
+
+### PDF (.pdf)
+
+**Spec basis:** PDF Document Info Dictionary (legacy, deprecated in PDF 2.0) +
+XMP metadata (ISO 16684-1, introduced PDF 1.4/Acrobat 5)
+
+**Storage mechanism:** Two parallel systems that should stay synchronized:
+1. **Document Info Dict** — simple `/Key (value)` pairs in PDF object
+2. **XMP stream** — full XML/RDF metadata using Dublin Core + Adobe PDF namespaces
+
+| Metadata Field       | DocInfo / XMP Location                           | Writable via Calibre | Round-trips? |
+|----------------------|--------------------------------------------------|---------------------|-------------|
+| Title                | `/Title` + `dc:title`                            | ✅ --title          | ✅          |
+| Authors              | `/Author` + `dc:creator`                         | ✅ --authors        | ✅          |
+| Publisher            | `dc:publisher` (XMP only)                        | ✅ --publisher      | ✅          |
+| Publication Date     | `dc:date` (XMP) / `/CreationDate` is different   | ✅ --date           | ✅          |
+| Language             | `dc:language` (XMP only)                         | ✅ --language       | ✅          |
+| Description          | `/Subject` (DocInfo) + `dc:description` (XMP)    | ✅ --comments       | ✅          |
+| ISBN                 | `dc:identifier` (XMP)                            | ✅ --isbn           | ✅          |
+| Other Identifiers    | `dc:identifier` (XMP)                            | ✅ --identifier     | ✅          |
+| Tags/Keywords        | `/Keywords` (DocInfo) + `dc:subject` (XMP)       | ✅ --tags           | ✅          |
+| Series               | `calibre:series` (XMP custom)                    | ✅ --series         | ✅ (calibre) |
+| Series Index         | `calibre:series_index` (XMP custom)              | ✅ --index          | ✅ (calibre) |
+| Cover (embedded)     | no native mechanism                              | ❌                  | ❌          |
+| Rating               | `calibre:rating` (XMP custom)                    | ✅ --rating         | ✅ (calibre) |
+| Original Date        | no standard field                                | ❌                  | ❌          |
+| LCC/DDC              | no standard field                                | ❌                  | ❌          |
+| Page Count           | inherent to PDF (but physical pages, not ebook)  | read only           | N/A         |
+
+**Notes:**
+- DocInfo is deprecated as of PDF 2.0 (ISO 32000-2) except CreationDate and ModDate
+- Calibre writes to BOTH DocInfo and XMP to maintain backward compatibility
+- `/Subject` in DocInfo maps to description, NOT to tags (confusing naming)
+- `/Keywords` in DocInfo maps to tags (comma-separated)
+- XMP supports arbitrary custom namespaces — calibre uses `calibre:` prefix
+- PDF/A requires XMP metadata (mandatory)
+- No native cover image metadata — PDFs render page 1 as thumbnail
+- **Key correction from previous code:** PDF supports publisher, date, language,
+  isbn, series via XMP — not just title/authors/description/tags
+
+---
+
+### MOBI (.mobi) / AZW (.azw)
+
+**Spec basis:** PalmDOC + MOBI Header + EXTH Header (undocumented, reverse-engineered)
+
+**Storage mechanism:** Binary EXTH records in PDB record 0. Language stored in
+MOBI header at offset 0x3C. Title in PDB header (31 bytes max) + EXTH record 99/503.
+
+| Metadata Field       | EXTH Record / Location                    | Writable via Calibre | Round-trips? |
+|----------------------|-------------------------------------------|---------------------|-------------|
+| Title                | EXTH 99 + PDB name + EXTH 503             | ✅ --title          | ✅          |
+| Authors              | EXTH 100 (creator)                        | ✅ --authors        | ✅          |
+| Publisher            | EXTH 101                                  | ✅ --publisher      | ✅          |
+| Publication Date     | EXTH 106 (publishingdate)                 | ✅ --date           | ✅          |
+| Language             | MOBI Header offset 0x3C (4 bytes)         | ✅ --language       | ✅          |
+| Description          | EXTH 103                                  | ✅ --comments       | ✅          |
+| ISBN                 | EXTH 104                                  | ✅ --isbn           | ✅          |
+| Tags/Subjects        | EXTH 105 (subject, multiple allowed)      | ✅ --tags           | ✅          |
+| Subject Code (BISAC) | EXTH 110 (subjectcode)                    | via identifiers     | ⚠️          |
+| Series               | EXTH 535 (calibre custom)                 | ✅ --series         | ✅ (calibre) |
+| Series Index         | EXTH 536 (calibre custom)                 | ✅ --index          | ✅ (calibre) |
+| Cover (embedded)     | EXTH 201 (coveroffset → image record)     | ✅ --cover          | ✅          |
+| ASIN                 | EXTH 113                                  | via identifiers     | ✅          |
+| Contributor          | EXTH 108                                  | read only           | read only   |
+| Rights               | EXTH 109                                  | read only           | read only   |
+| Imprint              | EXTH 102                                  | read only           | read only   |
+| Other Identifiers    | various EXTH records                      | ✅ --identifier     | ⚠️          |
+| Original Date        | no EXTH record                            | ❌                  | ❌          |
+| LCC/DDC              | no EXTH record                            | ❌                  | ❌          |
+| Page Count           | no EXTH record (ebook concept N/A)        | ❌                  | ❌          |
+| Genres (as distinct) | no EXTH record (use subjects EXTH 105)    | ❌ (use tags)       | ❌          |
+
+**Notes:**
+- EXTH header is undocumented/proprietary — all field IDs are reverse-engineered
+- MOBI and AZW are identical format except for DRM scheme
+- Series support via EXTH 535/536 is a Calibre convention, not in original spec
+- Multiple EXTH 105 records can store multiple subjects
+- EXTH 110 stores BISAC subject codes (separate from text subjects)
+- PDB header name limited to 31 bytes — full title in EXTH
+- Amazon's Kindle Paperwhite shows "Personal" label if EXTH 113 (ASIN) is missing
+- **Key correction:** MOBI/AZW DO support series via Calibre's custom EXTH records
+
+---
+
+### AZW3 / KF8 (.azw3)
+
+**Spec basis:** Compiled EPUB inside PDB container + MOBI backward-compat layer
+
+**Storage mechanism:** Dual structure — contains BOTH a MOBI (KF7) section for
+older Kindles AND a KF8 section (compiled EPUB with OPF-like metadata). EXTH
+records apply to both sections.
+
+| Metadata Field       | Storage Location                          | Writable via Calibre | Round-trips? |
+|----------------------|-------------------------------------------|---------------------|-------------|
+| Title                | EXTH + internal OPF dc:title              | ✅ --title          | ✅          |
+| Authors              | EXTH 100 + OPF dc:creator                 | ✅ --authors        | ✅          |
+| Publisher            | EXTH 101 + OPF dc:publisher               | ✅ --publisher      | ✅          |
+| Publication Date     | EXTH 106 + OPF dc:date                    | ✅ --date           | ✅          |
+| Language             | MOBI header + OPF dc:language             | ✅ --language       | ✅          |
+| Description          | EXTH 103 + OPF dc:description             | ✅ --comments       | ✅          |
+| ISBN                 | EXTH 104 + OPF dc:identifier              | ✅ --isbn           | ✅          |
+| Other Identifiers    | EXTH + OPF dc:identifier                  | ✅ --identifier     | ✅          |
+| Tags/Subjects        | EXTH 105 + OPF dc:subject                 | ✅ --tags           | ✅          |
+| Series               | EXTH 535 + OPF calibre:series             | ✅ --series         | ✅          |
+| Series Index         | EXTH 536 + OPF calibre:series_index       | ✅ --index          | ✅          |
+| Cover (embedded)     | EXTH 201 + manifest item                  | ✅ --cover          | ✅          |
+| Rating               | OPF calibre:rating                        | ✅ --rating         | ✅          |
+| Original Date        | no standard field                         | ❌                  | ❌          |
+| LCC/DDC              | no standard field                         | ❌                  | ❌          |
+| Page Count           | no standard field                         | ❌                  | ❌          |
+| Genres (as distinct) | no standard field (use dc:subject)        | ❌ (use tags)       | ❌          |
+
+**Notes:**
+- AZW3 is essentially "EPUB compiled into PDB format" — inherits most EPUB capabilities
+- Both EXTH records (for MOBI compat) and OPF metadata (for KF8) are present
+- Calibre's book editor can edit AZW3 files directly (same as EPUB editing)
+- KF8 targets EPUB3 but carries forward MOBI-era HTML constructs
+- Amazon deprecated MOBI uploads in 2022, now converts EPUB → AZW3/KFX internally
+
+---
+
+### FB2 (.fb2)
+
+**Spec basis:** FictionBook 2.0 XML specification (FictionBook.org)
+
+**Storage mechanism:** Single XML file. Metadata in `<description>` section with
+structured sub-elements: `<title-info>`, `<document-info>`, `<publish-info>`,
+`<custom-info>`.
+
+| Metadata Field       | FB2 Element                               | Writable via Calibre | Round-trips? |
+|----------------------|-------------------------------------------|---------------------|-------------|
+| Title                | `<book-title>`                            | ✅ --title          | ✅          |
+| Authors              | `<author>` (first/middle/last/nickname)   | ✅ --authors        | ✅          |
+| Publisher            | `<publisher>` in publish-info             | ✅ --publisher      | ✅          |
+| Publication Date     | `<date>` in title-info + `<year>` in pub  | ✅ --date           | ✅          |
+| Language             | `<lang>`                                  | ✅ --language       | ✅          |
+| Description          | `<annotation>` (HTML-like)                | ✅ --comments       | ✅          |
+| ISBN                 | `<isbn>` in publish-info                  | ✅ --isbn           | ✅          |
+| **Genres (NATIVE!)** | `<genre match="N">` (multiple, in title-info) | ✅ --tags       | ✅          |
+| Tags                 | mapped to/from genre elements             | ✅ --tags           | ✅          |
+| Series               | `<sequence name="" number="">`            | ✅ --series         | ✅          |
+| Series Index         | `<sequence>` number attribute             | ✅ --index          | ✅          |
+| Cover (embedded)     | `<coverpage><image>` + base64 binary      | ✅ --cover          | ✅          |
+| Translators          | `<translator>` in title-info              | read only           | read only   |
+| Source Language       | `<src-lang>`                              | read only           | read only   |
+| Document Author      | `<author>` in document-info               | N/A                 | N/A         |
+| City                 | `<city>` in publish-info                  | read only           | read only   |
+| Other Identifiers    | `<id>` in document-info                   | ✅ --identifier     | ✅          |
+| Original Date        | no standard field                         | ❌                  | ❌          |
+| LCC/DDC              | no standard field                         | ❌                  | ❌          |
+| Page Count           | no standard field                         | ❌                  | ❌          |
+
+**Notes:**
+- **FB2 is the ONLY format with native genre support** — `<genre>` is a first-class element
+- FB2 genre values come from a predefined list (Russian-origin taxonomy)
+- Genre `match` attribute (0-100) indicates confidence/relevance
+- Author names are structured: `<first-name>`, `<middle-name>`, `<last-name>`, `<nickname>`
+- Images stored as base64-encoded `<binary>` blocks inside the XML
+- `<sequence>` natively supports series with index — not a Calibre extension
+- `<custom-info>` allows arbitrary key/value metadata
+- Format popular in Russia; less common elsewhere
+
+---
+
+### CBZ (.cbz) / CBR (.cbr)
+
+**Spec basis:** ZIP/RAR archive of images. No formal metadata spec.
+
+**Storage mechanism:** Some tools use `ComicInfo.xml` (ComicRack convention) inside
+the archive. Calibre does NOT write this.
+
+| Metadata Field | Writable via Calibre | Notes |
+|---------------|---------------------|-------|
+| All fields    | ❌                  | Archive of images; no metadata container |
+
+---
+
+### DJVU (.djvu)
+
+**Spec basis:** DjVu format (AT&T Labs). Has annotation chunks but no standard metadata.
+
+| Metadata Field | Writable via Calibre | Notes |
+|---------------|---------------------|-------|
+| All fields    | ❌                  | Not in Calibre's writable format list |
+
+---
+
+## Summary Matrix: What Calibre ebook-meta Successfully Writes & Round-Trips
+
+| Field          | EPUB | PDF  | MOBI | AZW  | AZW3 | FB2  |
+|----------------|------|------|------|------|------|------|
+| title          | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   |
+| authors        | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   |
+| publisher      | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   |
+| date           | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   |
+| language       | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   |
+| description    | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   |
+| isbn           | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   |
+| identifiers    | ✅   | ✅   | ⚠️   | ⚠️   | ✅   | ✅   |
+| tags           | ✅   | ✅   | ✅   | ✅   | ✅   | ✅   |
+| series         | ✅   | ✅*  | ✅*  | ✅*  | ✅   | ✅   |
+| series_index   | ✅   | ✅*  | ✅*  | ✅*  | ✅   | ✅   |
+| cover_embed    | ✅   | ❌   | ✅   | ✅   | ✅   | ✅   |
+| genres (native)| ❌   | ❌   | ❌   | ❌   | ❌   | ✅   |
+| rating         | ✅   | ✅*  | ❌   | ❌   | ✅   | ❌   |
+
+`*` = Uses Calibre-specific custom metadata (XMP custom namespace or custom EXTH records).
+     Round-trips through Calibre but may not be recognized by other tools.
+
+`⚠️` = Partial support — ISBN works, but custom identifier types may not round-trip
+     through EXTH records in pure MOBI/AZW.
+
+---
+
+## Fields That NO Ebook Format Stores Natively
+
+These are library/catalog concepts with no format-level representation:
+
+| Field               | Why Not Storable                                          |
+|---------------------|----------------------------------------------------------|
+| Original Pub Date   | Formats only have one "date" field (publication date)     |
+| LCC Classification  | Library of Congress catalog system — no ebook equivalent  |
+| DDC Classification  | Dewey Decimal — library catalog system                    |
+| Page Count          | Physical book concept; ebook pages vary by viewer/device  |
+| Cover URL           | Formats embed cover images, not URLs to external images   |
+| Subtitle            | Most formats fold subtitle into title; no separate field  |
+| Edition             | No standard ebook field; some use description or custom   |
+
+---
+
+## Calibre ebook-meta Command Reference
+
+All available write options:
+```
+--title, -t          Set the title
+--authors, -a        Set authors (& separated)
+--publisher, -p      Set publisher
+--date, -d           Set published date
+--language, -l       Set language
+--comments, -c       Set description
+--isbn               Set ISBN
+--identifier         Set identifier (type:value, repeatable)
+--tags               Set tags (comma separated)
+--series, -s         Set series name
+--index, -i          Set series index
+--cover              Set cover image file
+--rating, -r         Set rating (1-5)
+--book-producer, -k  Set book producer
+--category           Set category
+--author-sort        Set author sort string
+--title-sort         Set title sort string
+```
+
+**Critical note from docs:** "Different file types support different kinds of
+metadata. If you try to set some metadata on a file type that does not support
+it, the metadata will be **silently ignored**."
+
+---
+
+## Sources
+
+1. **EPUB/OPF:** IDPF EPUB Packages 3.2 spec, Dublin Core 1.1 (ISO 15836),
+   MobileRead Wiki Dublin Core article, EbookLib documentation
+2. **PDF:** ISO 16684-1 (XMP), pikepdf documentation, PDFlib XMP knowledge base,
+   Adobe XMP Developer Center
+3. **MOBI/EXTH:** MobileRead Wiki MOBI article, Calibre source
+   `format_docs/pdb/mobi.txt`, KindleUnpack `mobi_header.py`, Go MOBI libraries
+   (766b/mobi, efskap/mobi, peterbn/mobi)
+4. **AZW3/KF8:** MobileRead Wiki KF8 article, Kindle File Format Wikipedia,
+   Amazon KDP documentation
+5. **FB2:** MobileRead Wiki FB2 article, FictionBook.org spec, ebookmeta Python library
+6. **Calibre:** ebook-meta v9.2.1 documentation, Calibre FAQ, Calibre source repository
