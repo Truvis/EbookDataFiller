@@ -1,0 +1,12 @@
+# Core (required)
+lxml>=4.9
+requests>=2.28
+beautifulsoup4>=4.11
+
+# Format-specific (install for those formats)
+ebooklib>=0.18       # EPUB read/write
+PyMuPDF>=1.23        # PDF text extraction + metadata
+mobi>=0.3            # MOBI/AZW/AZW3 extraction
+
+# Optional
+anthropic>=0.18      # Claude AI analysis (requires ANTHROPIC_API_KEY)
