@@ -1,768 +1,617 @@
-# 📚 Ebook Metadata Pipeline
+# Ebook Metadata Pipeline — User Guide
 
-A comprehensive metadata extraction, enrichment, writing, and renaming tool for large ebook collections. Processes `.epub`, `.pdf`, `.mobi`, `.azw`, `.azw3`, `.fb2`, and many more formats through a multi-stage pipeline that pulls from free catalogs, public APIs, and AI analysis to build rich, complete metadata — then writes it back into files and renames them cleanly.
+## What It Does
+
+This script scans a directory of ebook files, extracts and enriches their
+metadata from multiple sources, writes improved metadata back into the files,
+and renames them using a clean, consistent pattern. It handles encrypted files,
+scanned PDFs, corrupted archives, and filenames in dozens of languages.
+
+**Supported formats:** `.epub`, `.pdf`, `.mobi`, `.azw`, `.azw3`, `.fb2`,
+`.txt`, `.html`, `.htm`, `.djvu`, `.cbz`, `.cbr`, `.lit`, `.doc`, `.docx`,
+`.rtf`, `.odt`
 
 ---
 
-## Pipeline Architecture
+## Installation
+
+### Option 1: Auto-bootstrap (recommended)
+
+```bash
+python ebook_metadata_pipeline.py /path/to/ebooks --bootstrap-venv
+```
+
+This creates a virtual environment at `~/.venvs/ebook-pipeline`, installs all
+Python dependencies, and re-launches the script inside that venv. Subsequent
+runs auto-detect the venv and use it without the flag.
+
+### Option 2: Manual venv
+
+```bash
+python -m venv ~/.venvs/ebook-pipeline
+source ~/.venvs/ebook-pipeline/bin/activate
+pip install ebooklib PyMuPDF lxml requests anthropic mobi beautifulsoup4
+python ebook_metadata_pipeline.py /path/to/ebooks
+```
+
+### Option 3: System-wide (not recommended)
+
+```bash
+pip install ebooklib PyMuPDF lxml requests anthropic mobi beautifulsoup4 --break-system-packages
+python ebook_metadata_pipeline.py /path/to/ebooks
+```
+
+### External tool (required for metadata writing)
+
+```bash
+sudo apt install calibre    # provides ebook-meta and ebook-convert
+```
+
+Calibre's `ebook-meta` writes metadata into files; `ebook-convert` is used as a
+fallback text extractor. Without Calibre the script still runs but skips writing
+and may fail to extract text from some formats.
+
+---
+
+## Dependencies
+
+| Dependency | pip name | Role | Required? |
+|---|---|---|---|
+| `ebooklib` | `ebooklib` | EPUB read/write | For EPUB |
+| `PyMuPDF` (fitz) | `PyMuPDF` | PDF text extraction + metadata write | For PDF |
+| `lxml` | `lxml` | XML parsing (RDF, FB2, HTML) | **Critical** |
+| `requests` | `requests` | API calls + cover downloads | **Critical** |
+| `beautifulsoup4` | `beautifulsoup4` | HTML text extraction | **Critical** |
+| `anthropic` | `anthropic` | Claude AI analysis | Optional |
+| `mobi` | `mobi` | MOBI/AZW text extraction | For MOBI |
+| `calibre` | system package | Metadata writing + fallback extraction | Recommended |
+
+Missing non-critical modules cause graceful degradation — those formats process
+with reduced capability, and the script warns you at startup.
+
+---
+
+## How the Pipeline Works
+
+Each file passes through up to 7 stages. The pipeline short-circuits
+intelligently — if enough metadata is already known, later stages are skipped.
+
+### Stage-by-Stage
+
+1. **Gutenberg RDF Catalog** — If the filename contains a Project Gutenberg ID
+   (e.g. `pg12345`), the script looks it up in a local copy of the Gutenberg RDF
+   catalog (~70K books). This is the fastest and most reliable source for public
+   domain texts. Extracts title, authors, editors, translators, subjects (LCSH),
+   LCC classification, language, rights, and publication date.
+
+2. **Embedded Metadata** — Reads whatever metadata already exists inside the
+   file. Uses `ebook-meta` (Calibre) plus format-native libraries (ebooklib for
+   EPUB, PyMuPDF for PDF, mobi for MOBI/AZW). Records the original state so
+   changes can be displayed as a diff later.
+
+3. **Filename Parsing** — Parses the filename to extract author, title,
+   publisher, year, edition, and series info. Uses an author-scoring heuristic to
+   decide which part of `Title - Author Name.epub` is the title vs the author.
+   Detects garbage embedded titles (like "Frontmatter" or "Microsoft Word") and
+   replaces them from the filename.
+
+4. **Text Extraction + Readability Check** — Extracts the first N pages of text
+   (default 15) for two purposes: feeding to the AI analyzer, and detecting
+   whether the file is actually readable. Reports encrypted, corrupted,
+   scanned-image-only, and no-text files. Tries format-native extraction first,
+   falls back to `ebook-convert` (Calibre).
+
+5. **Public API Lookups** — Queries Open Library and Google Books to fill missing
+   fields. Only fires if 2+ metadata fields are still missing after embedded +
+   filename parsing. Implements rate limiting, exponential backoff, API key
+   rotation, and circuit-breaker logic. Results are merged without overwriting
+   existing data.
+
+6. **AI Text Analysis** — If the completeness score is still below the threshold
+   (default 40%), sends the extracted text to Claude (Sonnet) and asks it to
+   identify the book and return structured metadata as JSON. There is also an AI
+   fallback mode for completely unreadable files that analyzes the filename alone.
+
+7. **Genre/Subject Inference** — If no genres or subjects were found from any
+   source, infers them from existing tags, title keywords, and other metadata
+   using pattern matching (no API call).
+
+After all stages, the script:
+
+- **Displays a diff** showing what was found in the file vs what changed, split
+  into three categories: writable changes, API-found-but-unstorable fields, and
+  derived-from-existing data.
+- **Writes metadata** back into the file using Calibre's `ebook-meta` plus
+  format-specific writers (ebooklib for EPUB extras, PyMuPDF for PDF).
+- **Renames the file** using the pattern:
+  `Title (Year) [Edition] (Series #N) - Author.ext`
+- **Caches results** in a SQLite database so re-runs skip already-processed files.
+
+---
+
+## ASCII Workflow Tree
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         INPUT: Ebook File                           │
-│  (.epub, .pdf, .mobi, .azw, .azw3, .fb2, .txt, .html, .djvu, ...) │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  STAGE 0 — Discovery & Deduplication                                │
-│  • Recursive directory scan for supported formats                   │
-│  • Dedup by path, symlink, and (filename + size)                    │
-│  • Cache check: skip files already processed (unless --force)       │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  STAGE 1 — Gutenberg RDF Catalog                                    │
-│  Fastest, most reliable for Project Gutenberg books.                │
-│  • Detects PG ID from filename (pg12345) or path (/12345/)         │
-│  • Parses local RDF/XML for title, authors, subjects, LCC, rights  │
-│  • Auto-downloads catalog (~300MB) on first run if missing          │
-│                                                                     │
-│  Skip: --skip-rdf                                                   │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  STAGE 2 — Embedded Metadata Extraction                             │
-│  Reads what's already inside the file.                              │
-│  • Calibre CLI (ebook-meta) for universal format support            │
-│  • Format-specific deep extraction:                                 │
-│    ├── EPUB: OPF metadata (DC elements, roles, identifiers)        │
-│    ├── PDF:  XMP/Info dict via PyMuPDF (+ page count)              │
-│    └── FB2:  XML title-info, publish-info, sequences               │
-│  • Garbage detection: rejects titles like "out.jpg", "Untitled",   │
-│    "Frontmatter", swapped author/title fields, invalid dates       │
-│  • Filename parsing fallback with author/title scoring heuristics  │
-│  • Author cleanup: deduplication, credential stripping, semicolon  │
-│    splitting, "Last, First" normalization                           │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  STAGE 3 — Public API Enrichment                                    │
-│  Fills gaps with free public book databases.                        │
-│                                                                     │
-│  ┌──────────────────────────────────────────────────────────────┐   │
-│  │  Phase 1: Open Library (always first — free, no key needed)  │   │
-│  │  • ISBN lookup → title/author search                         │   │
-│  │  • Returns: ISBN, language, subjects, LCC/DDC, pages,        │   │
-│  │    cover, description, publisher, original pub date          │   │
-│  │  • Works API follow-up for richer descriptions               │   │
-│  └──────────────────────────┬───────────────────────────────────┘   │
-│                             │                                       │
-│                    ┌────────┴────────┐                               │
-│                    │  Decision Gate  │                               │
-│                    └────────┬────────┘                               │
-│              ┌──────────────┼──────────────┐                        │
-│              ▼              ▼              ▼                         │
-│         OL found       OL found       OL found                      │
-│        nothing       completeness    completeness                   │
-│                        < 70%           ≥ 70%                        │
-│              │              │              │                         │
-│              ▼              ▼              ▼                         │
-│  ┌───────────────┐ ┌───────────────┐  ┌────────────┐               │
-│  │ Google Books  │ │ Google Books  │  │   SKIP     │               │
-│  │  (fallback)   │ │  (fallback)   │  │  Google ✓  │               │
-│  └───────────────┘ └───────────────┘  └────────────┘               │
-│                                                                     │
-│  Google Books features:                                             │
-│  • API key rotation (round-robin, per-key circuit breakers)         │
-│  • Exponential backoff on 429s with Retry-After support             │
-│  • Auto-disables after consecutive failures                         │
-│                                                                     │
-│  Skip: --skip-api          Threshold: --api-threshold (default 0.7) │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  STAGE 4 — AI Text Analysis (Claude API)                            │
-│  Last resort for books APIs couldn't identify.                      │
-│  • Extracts text from first ~15,000 chars of the book               │
-│  • Sends to Claude with structured JSON prompt                      │
-│  • Returns: title, authors, publisher, date, language,              │
-│    description, subjects, genres, series, ISBNs                     │
-│  • Only fires when completeness < ai-threshold (default 0.4)       │
-│                                                                     │
-│  Skip: --skip-ai          Threshold: --ai-threshold (default 0.4)  │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  STAGE 4.5 — Genre & Subject Inference (no API needed)              │
-│  Rule-based classification from existing metadata.                  │
-│  • DDC code → genre mapping (Dewey Decimal Classification)          │
-│  • LCC code → genre mapping (Library of Congress Classification)    │
-│  • Title/subtitle keyword → genre/subject inference                 │
-│  • Publisher → genre hints (e.g., Packt → Computers)                │
-│  • Tag normalization and cleanup                                    │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  STAGE 5 — Metadata Writing                                         │
-│  Writes enriched metadata back into the file.                       │
-│  • Calibre ebook-meta: title, authors, publisher, date, language,   │
-│    tags, series, ISBN, identifiers, cover image download & embed    │
-│  • EPUB extras: DC subjects, contributor roles, source links        │
-│  • PDF extras: XMP metadata via PyMuPDF                             │
-│  • Cover download: auto-fetches from OL/Google, validates size      │
-│                                                                     │
-│  Skip: --skip-write         Preview: --dry-run                      │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  STAGE 6 — File Renaming                                            │
-│  Renames files to a clean, consistent format.                       │
-│                                                                     │
-│  Format: Title (Year) [Edition] (Series #N) - Author.ext            │
-│                                                                     │
-│  Examples:                                                          │
-│    Mastering Malware Analysis (2022) [2nd Edition] - Alexey K....   │
-│    Foundations of Analog and Digital Electronic Circuits (2005)...   │
-│    Search Inside Yourself (2012) - Chade-Meng Tan.mobi              │
-│                                                                     │
-│  • Collision handling (appends counter)                              │
-│  • "Last, First" → "First Last" for filenames                       │
-│  • Multi-author: "A & B" or "A et al."                              │
-│                                                                     │
-│  Skip: --skip-rename        Preview: --dry-run                      │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  OUTPUT                                                             │
-│  • Enriched ebook file with embedded metadata + cover               │
-│  • Cleanly renamed file                                             │
-│  • SQLite cache entry (skip on re-run)                              │
-│  • JSON processing report + JSONL stats log                         │
-│  • Per-file error log                                               │
-└─────────────────────────────────────────────────────────────────────┘
+START
+  │
+  ├─── Discover files (recursive walk, filter by extension)
+  │    ├── Dedup by path + (filename, size)
+  │    ├── Apply --limit N
+  │    └── Check cache (skip already-processed unless --force)
+  │
+  │  ┌──────────── FOR EACH FILE ────────────┐
+  │  │                                        │
+  │  │  [0] Pre-checks                        │
+  │  │   ├── --max-file-size? ──YES──► SKIP   │
+  │  │   └── Compute SHA-256 hash             │
+  │  │                                        │
+  │  │  [1] Gutenberg RDF Catalog             │
+  │  │   ├── --skip-rdf? ──YES──► skip        │
+  │  │   ├── Detect PG ID from filename       │
+  │  │   │   └── Found? ──YES──► Parse RDF    │
+  │  │   │       └── Merge: title, authors,   │
+  │  │   │           subjects, LCC, language   │
+  │  │   └── No ID? ──► continue              │
+  │  │                                        │
+  │  │  [2] Embedded Metadata                 │
+  │  │   ├── ebook-meta (Calibre CLI)         │
+  │  │   ├── Format-native (ebooklib/fitz/    │
+  │  │   │   mobi module)                     │
+  │  │   ├── Snapshot "original_meta"         │
+  │  │   └── Merge into working metadata      │
+  │  │                                        │
+  │  │  [2.5] Filename Parsing                │
+  │  │   ├── Extract: author, title, year,    │
+  │  │   │   publisher, edition               │
+  │  │   ├── Garbage title detection           │
+  │  │   │   └── Bad title? ──► replace from  │
+  │  │   │       filename                     │
+  │  │   └── Fill any still-empty fields      │
+  │  │                                        │
+  │  │  [2.75] Text Extraction                │
+  │  │   ├── Try native extractor             │
+  │  │   │   └── epub-native / pdf-pymupdf /  │
+  │  │   │       mobi-native / fb2-native     │
+  │  │   ├── Fail? ──► Try calibre-convert    │
+  │  │   ├── Detect: encrypted, corrupted,    │
+  │  │   │   scanned-image-only, no-text      │
+  │  │   └── ReadabilityResult recorded       │
+  │  │                                        │
+  │  │  [3] Public APIs                       │
+  │  │   ├── --skip-api? ──YES──► skip        │
+  │  │   ├── Missing ≥2 fields? ──NO──► skip  │
+  │  │   ├── Open Library search              │
+  │  │   │   ├── By ISBN (if known)           │
+  │  │   │   └── By title + author            │
+  │  │   ├── Google Books search              │
+  │  │   │   ├── By ISBN (if known)           │
+  │  │   │   └── By title + author            │
+  │  │   │   └── Requires --google-api-key    │
+  │  │   └── Merge new fields (never          │
+  │  │       overwrite existing)              │
+  │  │                                        │
+  │  │  [4] AI Analysis                       │
+  │  │   ├── --skip-ai? ──YES──► skip         │
+  │  │   ├── Has text AND score < threshold?  │
+  │  │   │   └── YES ──► Send text to Claude  │
+  │  │   │       └── Parse JSON response      │
+  │  │   │       └── Merge results            │
+  │  │   ├── Unreadable file + AI available?  │
+  │  │   │   └── YES ──► AI filename fallback │
+  │  │   │       └── Identify book from name  │
+  │  │   └── Neither? ──► skip                │
+  │  │                                        │
+  │  │  [4.5] Genre/Subject Inference         │
+  │  │   └── Still no genres/subjects?        │
+  │  │       └── Infer from tags + title      │
+  │  │                                        │
+  │  │  [5] Metadata Write                    │
+  │  │   ├── --skip-write? ──YES──► skip      │
+  │  │   ├── --dry-run? ──YES──► skip         │
+  │  │   ├── No writable changes? ──► skip    │
+  │  │   ├── Corrupted/encrypted? ──► skip    │
+  │  │   ├── Calibre ebook-meta               │
+  │  │   │   └── title, authors, publisher,   │
+  │  │   │       date, language, description, │
+  │  │   │       tags, series, ISBN, cover,   │
+  │  │   │       identifiers                  │
+  │  │   ├── EPUB extra (ebooklib)            │
+  │  │   │   └── subjects, editors,           │
+  │  │   │       translators, illustrators,   │
+  │  │   │       rights, source               │
+  │  │   └── PDF extra (PyMuPDF)              │
+  │  │       └── fitz metadata dict           │
+  │  │                                        │
+  │  │  [6] Rename                            │
+  │  │   ├── --skip-rename? ──YES──► skip     │
+  │  │   ├── --dry-run? ──YES──► show only    │
+  │  │   ├── Build new name:                  │
+  │  │   │   Title (Year) [Edition]           │
+  │  │   │   (Series #N) - Author.ext         │
+  │  │   ├── Collision? ──► append (1), (2)   │
+  │  │   └── os.rename()                      │
+  │  │                                        │
+  │  │  [7] Report + Cache                    │
+  │  │   ├── Display: completeness score,     │
+  │  │   │   sources used, missing fields     │
+  │  │   ├── Write to SQLite cache            │
+  │  │   └── Append to JSON report            │
+  │  │                                        │
+  │  └────────────────────────────────────────┘
+  │
+  ├─── Print summary statistics
+  └─── Save report to log directory
 ```
 
 ---
 
 ## Completeness Scoring
 
-Every book gets a weighted completeness score (0–100%) that drives pipeline decisions:
+Each file gets a 0–100% score based on weighted fields:
 
-| Field         | Weight | Notes                          |
-|---------------|--------|--------------------------------|
-| Title         | 20     | Most important identifier      |
-| Authors       | 20     | Critical for naming/search     |
-| Pub. Date     | 10     | Year or full ISO date          |
-| Description   | 10     | Synopsis / back cover text     |
-| Subjects      | 8      | LCSH headings, topic keywords  |
-| Language      | 5      | ISO 639 code                   |
-| ISBN-13       | 5      | Primary book identifier        |
-| Publisher     | 5      | Publishing house               |
-| Genres        | 5      | BISAC / broad categories       |
-| ISBN-10       | 3      | Legacy identifier              |
-| Series        | 3      | Series name + index            |
-| Page Count    | 3      | Physical page count            |
-| Cover URL     | 3      | Cover image source             |
-| **Total**     | **100**|                                |
+| Field | Weight | Field | Weight |
+|---|---|---|---|
+| `title` | 20 | `isbn_13` | 5 |
+| `authors` | 20 | `isbn_10` | 3 |
+| `publication_date` | 10 | `publisher` | 5 |
+| `description` | 10 | `genres` | 5 |
+| `subjects` | 8 | `series` | 3 |
+| `language` | 5 | `page_count` | 3 |
+| | | `cover_url` | 3 |
+
+The `--ai-threshold` option controls when AI analysis kicks in. If the score is
+below this threshold after stages 1–3, the text is sent to Claude.
 
 ---
 
-## Installation
+## Rename Pattern
 
-### Prerequisites
+Files are renamed to:
 
-```bash
-# Core dependencies
-pip install ebooklib PyMuPDF lxml requests anthropic mobi beautifulsoup4 --break-system-packages
-
-# Calibre CLI tools (required for metadata writing)
-sudo apt install calibre
 ```
-
-### Gutenberg RDF Catalog (optional, auto-downloads on first run)
-
-```bash
-# Manual download if preferred
-wget https://www.gutenberg.org/cache/epub/feeds/rdf-files.tar.bz2 -O ~/gutenberg-rdf/rdf-files.tar.bz2
-cd ~/gutenberg-rdf && tar xjf rdf-files.tar.bz2
+Title (Year) [Edition] (Series #Index) - Author.ext
 ```
-
----
-
-## Quick Start
-
-```bash
-# Preview what would change (safe, no modifications)
-python3 do.py /path/to/ebooks --dry-run --verbose
-
-# Run for real with all defaults
-python3 do.py /path/to/ebooks
-
-# Process with 4 threads, aggressive AI enrichment
-python3 do.py /path/to/ebooks --threads 4 --ai-threshold 0.7
-
-# RDF + embedded only (no network calls)
-python3 do.py /path/to/ebooks --skip-api --skip-ai
-```
-
----
-
-## CLI Reference
-
-### Positional Arguments
-
-| Argument     | Description                                   |
-|-------------|-----------------------------------------------|
-| `ebook_dir` | Directory containing ebook files (recursive)  |
-
-### Source Control
-
-| Flag                     | Default                  | Description                                                       |
-|--------------------------|--------------------------|-------------------------------------------------------------------|
-| `--rdf-catalog PATH`    | `~/gutenberg-rdf`        | Path to Gutenberg RDF catalog directory                           |
-| `--skip-rdf`            | off                      | Skip Gutenberg RDF catalog entirely                               |
-| `--auto-download-rdf`   | off                      | Auto-download RDF catalog without prompting if missing            |
-| `--skip-api`            | off                      | Skip all public API lookups (Open Library + Google Books)         |
-| `--skip-ai`             | off                      | Skip AI text analysis via Claude                                  |
-
-### Threshold Tuning
-
-| Flag                     | Default | Description                                                        |
-|--------------------------|---------|--------------------------------------------------------------------|
-| `--api-threshold FLOAT` | `0.7`   | Completeness below which API lookups trigger (0.0–1.0)             |
-| `--ai-threshold FLOAT`  | `0.4`   | Completeness below which AI analysis triggers (0.0–1.0)            |
 
 **Examples:**
 
+| Before | After |
+|---|---|
+| `pg1342.epub` | `Pride and Prejudice (1813) - Jane Austen.epub` |
+| `9780134685991.pdf` | `Effective Java (2018) [3rd Edition] - Joshua Bloch.pdf` |
+| `unknown_scifi_book.mobi` | `Dune (1965) (Dune #1) - Frank Herbert.mobi` |
+| `GoF patterns.pdf` | `Design Patterns (1994) - Erich Gamma et al..pdf` |
+
+Multiple authors show as `Author1 & Author2` for two, or `Author1 et al.` for
+three or more. Collision handling appends `(1)`, `(2)`, etc.
+
+---
+
+## Change Display Categories
+
+When processing each file, the pipeline shows what's new in three sections:
+
+- **CHANGES** (green `+` or yellow `✎`) — New or updated data that can be
+  written to this file format. These trigger the metadata write stage.
+- **API FOUND** (cyan `◆`) — Data discovered from APIs but the file format
+  doesn't support it (e.g. LCC classification in a PDF, page count in any
+  ebook). Saved to cache only.
+- **DERIVED** (gray `~`) — Inferred from data already embedded in the file
+  (e.g. genres inferred from existing tags). Display only, not written.
+
+---
+
+## Caching
+
+Results are stored in a SQLite database at `/tmp/ebook_metadata_<hash>.db`
+(keyed to the target directory). On re-runs, already-processed files are skipped
+unless `--force` is used. The cache tracks:
+
+- File path, size, and modification time
+- Completeness score and processing status
+- Readability status (encrypted, corrupted, scanned, etc.)
+- Full metadata JSON snapshot
+- Sources used and processing timestamp
+
+If a file is renamed, the cache entry is updated to the new path and the old
+entry is removed.
+
+---
+
+## All Options
+
+### Required Argument
+
+| Argument | Description |
+|---|---|
+| `ebook_dir` | Directory to scan (recursive). |
+
 ```bash
-# Always run AI (even for nearly complete books)
---ai-threshold 1.0
-
-# Only use AI for truly empty metadata
---ai-threshold 0.2
-
-# Conservative API usage (only for very incomplete books)
---api-threshold 0.3
-
-# Aggressive enrichment (API + AI for anything under 90%)
---api-threshold 0.9 --ai-threshold 0.9
+python ebook_metadata_pipeline.py /data/ebooks
 ```
 
-### API Keys
+---
 
-| Flag                       | Default          | Description                                                     |
-|----------------------------|------------------|-----------------------------------------------------------------|
-| `--google-api-key KEY`    | built-in default | Google Books API key. Repeat flag or comma-separate for multiple |
-| `--anthropic-api-key KEY` | `$ANTHROPIC_API_KEY` env | Anthropic API key for Claude AI analysis                    |
+### Data Source Options
 
-**Multiple Google API keys (round-robin rotation):**
+| Option | Default | Description |
+|---|---|---|
+| `--rdf-catalog PATH` | `~/gutenberg-rdf` | Path to Gutenberg RDF catalog directory. |
+| `--auto-download-rdf` | off | Download the RDF catalog (~300MB) without prompting. |
+| `--anthropic-api-key KEY` | `$ANTHROPIC_API_KEY` | API key for Claude AI analysis. |
+| `--google-api-key KEY` | none | Google Books API key. Repeat for multiple keys (rotation). |
+
+**Gutenberg RDF Catalog:** The script will prompt to download it on first run
+if not found. Use `--auto-download-rdf` for unattended setups. The catalog
+is a ~300MB tarball that extracts to ~2GB of individual RDF/XML files.
 
 ```bash
-# Comma-separated
---google-api-key "AIza...one,AIza...two,AIza...three"
+# First run — auto-download catalog
+python ebook_metadata_pipeline.py /data/ebooks --auto-download-rdf
 
-# Repeated flags
---google-api-key AIza...one --google-api-key AIza...two
+# Use a custom catalog location
+python ebook_metadata_pipeline.py /data/ebooks --rdf-catalog /mnt/data/gutenberg-rdf
+
+# Multiple Google API keys for quota rotation
+python ebook_metadata_pipeline.py /data/ebooks \
+  --google-api-key AIzaSyA...key1 \
+  --google-api-key AIzaSyB...key2 \
+  --google-api-key AIzaSyC...key3
+
+# AI via environment variable
+export ANTHROPIC_API_KEY="sk-ant-..."
+python ebook_metadata_pipeline.py /data/ebooks
 ```
 
-Keys rotate round-robin per request. A key that gets 403'd is individually disabled while others continue. When all keys are exhausted, Google Books is disabled for the remainder of the run.
+---
 
-### Output Control
+### Skip Flags
 
-| Flag             | Default | Description                                         |
-|------------------|---------|-----------------------------------------------------|
-| `--dry-run`      | off     | Preview all changes without modifying any files      |
-| `--skip-write`   | off     | Skip writing metadata back into files                |
-| `--skip-rename`  | off     | Skip file renaming                                   |
+| Option | Effect |
+|---|---|
+| `--skip-rdf` | Skip Gutenberg RDF catalog lookups entirely. |
+| `--skip-api` | Skip Open Library and Google Books API calls. |
+| `--skip-ai` | Skip Claude AI text analysis. |
+| `--skip-write` | Skip writing metadata back into files. |
+| `--skip-rename` | Skip renaming files. |
+| `--skip-dep-install` | Don't auto-install missing Python packages. |
+| `--dry-run` | Preview all changes without modifying any files (no writes, no renames). |
 
-### Processing Control
+These can be combined freely:
 
-| Flag             | Default | Description                                         |
-|------------------|---------|-----------------------------------------------------|
-| `--threads N`    | `1`     | Parallel processing threads                          |
-| `--limit N`      | all     | Process only the first N files                       |
-| `--force`        | off     | Reprocess all files, ignoring cache                  |
-| `--verbose`      | off     | Show debug-level output                              |
-| `--log-dir PATH` | `<ebook_dir>/.metadata_logs` | Directory for log files            |
+```bash
+# Read-only audit — see what the pipeline would do
+python ebook_metadata_pipeline.py /data/ebooks --dry-run
+
+# Offline mode — embedded + filename only, no network
+python ebook_metadata_pipeline.py /data/ebooks --skip-api --skip-ai --skip-rdf
+
+# Enrich metadata but don't rename files
+python ebook_metadata_pipeline.py /data/ebooks --skip-rename
+
+# Only extract and display — no writes at all
+python ebook_metadata_pipeline.py /data/ebooks --skip-write --skip-rename
+
+# API lookups only, no AI spending
+python ebook_metadata_pipeline.py /data/ebooks --skip-ai
+```
+
+---
+
+### Processing Controls
+
+| Option | Default | Description |
+|---|---|---|
+| `--limit N` | all | Process only the first N files. |
+| `--max-pages N` | `15` | Max pages of text to extract per file. |
+| `--max-file-size N` | `0` (unlimited) | Skip files larger than N megabytes. |
+| `--ai-threshold F` | `0.4` | Completeness score (0.0–1.0) below which AI analysis triggers. |
+| `--threads N` | `1` | Number of parallel processing threads. |
+| `--force` | off | Reprocess all files, ignoring the cache. |
+| `--verbose` / `-v` | off | Show detailed extraction and debug info. |
+
+```bash
+# Test with 5 files first
+python ebook_metadata_pipeline.py /data/ebooks --limit 5 --verbose
+
+# Process a huge library in parallel
+python ebook_metadata_pipeline.py /data/ebooks --threads 4
+
+# More aggressive AI usage (trigger at 60% instead of 40%)
+python ebook_metadata_pipeline.py /data/ebooks --ai-threshold 0.6
+
+# Skip giant PDFs (over 200MB)
+python ebook_metadata_pipeline.py /data/ebooks --max-file-size 200
+
+# Force reprocess everything (ignore cache)
+python ebook_metadata_pipeline.py /data/ebooks --force
+
+# Extract more text for better AI analysis
+python ebook_metadata_pipeline.py /data/ebooks --max-pages 30
+```
+
+---
 
 ### Cache Management
 
-| Flag             | Description                                    |
-|------------------|------------------------------------------------|
-| `--cache-stats`  | Show cache statistics and exit                  |
-| `--cache-clear`  | Clear the processing cache and exit             |
+| Option | Effect |
+|---|---|
+| `--show-cache` | Print cache statistics and exit. |
+| `--show-problems` | Show unreadable, errored, and low-completeness files from cache. |
+| `--clear-cache` | Delete the processing cache and exit. |
 
-The SQLite cache lives in `/tmp/ebook_metadata_<hash>.db` (or `<ebook_dir>/.metadata_cache.db` if `/tmp` is unavailable). It tracks processed files by path, size, and mtime — changed files are automatically reprocessed.
+```bash
+# Check how many books are tracked, average completeness
+python ebook_metadata_pipeline.py /data/ebooks --show-cache
 
----
+# Find problem files — encrypted, corrupted, scanned PDFs
+python ebook_metadata_pipeline.py /data/ebooks --show-problems
 
-## Output Format
-
-Each file produces a detailed processing card:
-
-```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  [7/273] (3%)
-
-┌─── 📖 Axelson - Serial Port Complete (2007).pdf
-│  .pdf  •  4130 KB
-│  ⚠ Embedded metadata looks suspect — using filename
-│  ↻ Searching APIs...
-│    ✓ Open Library: ISBN, language, pages, cover, subjects, publisher, LCC
-│    ⊘ Google Books: skipped (OL sufficient at 97%)
-│  ⟶ Serial Port Complete (2007) - Axelson.pdf
-│
-│  ─── FOUND IN FILE ───
-│    Title:       Axelson
-│    Authors:     Serial Port Complete (2007)
-│
-│  ─── CHANGES (DRY RUN) ───
-│  ✎ Title         Serial Port Complete
-│    was:          Axelson
-│  ✎ Authors       Axelson
-│    was:          Serial Port Complete (2007)
-│  + Publisher     Lakeview Research
-│  + ISBN-13       9781931448079
-│  + Language      eng
-│  + Pages         343
-│  + Cover         ✓ covers.openlibrary.org
-│
-│  ✅ 97% complete  •  2.0s  •  ☑ Embedded  ☑ OpenLibrary
-└────────────────────────────────────────────────────────────
-```
-
-**Legend:**
-
-| Symbol | Meaning |
-|--------|---------|
-| `+`    | New field added (was empty) |
-| `✎`    | Existing field modified |
-| `✓`    | API returned results |
-| `✗`    | API returned no results or errored |
-| `⊘`    | API intentionally skipped |
-| `⚠`    | Warning (garbage metadata detected, etc.) |
-| `☑`    | Source contributed to final metadata |
-
----
-
-## API Fallback Strategy
-
-The pipeline minimizes paid/rate-limited API calls:
-
-```
-         ┌──────────────┐
-         │  Need data?  │
-         └──────┬───────┘
-                │
-                ▼
-       ┌────────────────┐
-       │ Open Library    │  ◄── Always first (free, no key, no hard quota)
-       │ ISBN → Search   │
-       └───────┬────────┘
-               │
-         ┌─────┴─────┐
-         │           │
-    Got results?  No results
-         │           │
-         ▼           │
-   Completeness      │
-     ≥ 70%?          │
-    ┌───┴───┐        │
-   Yes      No       │
-    │       │        │
-    ▼       ▼        ▼
-  DONE   ┌──────────────┐
-  (skip  │ Google Books  │  ◄── Only when OL fails or insufficient
-  Google)│ ISBN → Search │      Rate-limited, key rotation, circuit breakers
-         └──────┬───────┘
-                │
-           Got results?
-          ┌─────┴─────┐
-         Yes          No
-          │            │
-          ▼            ▼
-        DONE     Completeness
-                   < 40%?
-                 ┌───┴───┐
-                Yes      No
-                 │        │
-                 ▼        ▼
-           ┌──────────┐  DONE
-           │ Claude AI │  ◄── Last resort: extracts metadata from book text
-           │ Analysis  │      Requires --anthropic-api-key or $ANTHROPIC_API_KEY
-           └──────────┘
+# Wipe cache and start fresh
+python ebook_metadata_pipeline.py /data/ebooks --clear-cache
 ```
 
 ---
 
-## Supported Formats
+### Virtual Environment Options
 
-| Format | Read Metadata | Write Metadata | Text Extraction |
-|--------|:---:|:---:|:---:|
-| `.epub` | ✅ OPF + Calibre | ✅ Calibre + OPF | ✅ ebooklib |
-| `.pdf` | ✅ PyMuPDF + Calibre | ✅ PyMuPDF + Calibre | ✅ PyMuPDF |
-| `.mobi` | ✅ Calibre | ✅ Calibre | ✅ mobi lib / Calibre |
-| `.azw` / `.azw3` | ✅ Calibre | ✅ Calibre | ✅ mobi lib / Calibre |
-| `.fb2` | ✅ Native XML + Calibre | ✅ Calibre | ✅ Native XML |
-| `.txt` / `.html` | ✅ Calibre | ✅ Calibre | ✅ Direct read |
-| `.djvu` | ✅ Calibre | ✅ Calibre | via Calibre convert |
-| `.cbz` / `.cbr` | ✅ Calibre | ✅ Calibre | — |
-| `.lit` | ✅ Calibre | ✅ Calibre | via Calibre convert |
-| `.doc` / `.docx` / `.rtf` / `.odt` | ✅ Calibre | ✅ Calibre | via Calibre convert |
-
----
-
-## Garbage Detection
-
-Embedded metadata in ebooks is frequently wrong — especially in PDFs where tools like InDesign, Acrobat, or scanning software inject nonsense. The pipeline detects and corrects:
-
-| Problem | Example | Action |
-|---------|---------|--------|
-| Filename as title | `out.jpg`, `1931448043.pdf`, `0750657847-prelims.pdf` | Replace with parsed filename |
-| Structural page name | `Frontmatter`, `Preface`, `Table of Contents`, `Copyright` | Replace with parsed filename |
-| App artifacts | `Microsoft Word - doc`, `Untitled`, `module tem-1` | Replace with parsed filename |
-| Swapped author/title | Title: `"Barton"` Author: `"Radar Technology Encyclopedia"` | Swap from filename parsing |
-| Invalid dates | `0101-01-01T00:00:00` | Replace with year from filename |
-| Duplicate authors | `"Cameron Malin"` + `"Cameron H. Malin"` | Deduplicate by name overlap |
-| Credential suffixes | `"Eoghan Casey BS MA"` | Strip non-name tokens |
-| Title-like authors | Author: `"Comprehensive Guide To Digital Electronics"` | Remove, use filename author |
-
----
-
-## Logging & Reports
-
-All runs generate logs in `<ebook_dir>/.metadata_logs/` (or `--log-dir`):
-
-| File | Content |
-|------|---------|
-| `pipeline_YYYYMMDD_HHMMSS.log` | Full trace log (all levels including TRACE) |
-| `errors_YYYYMMDD_HHMMSS.log` | Errors only |
-| `stats_YYYYMMDD_HHMMSS.jsonl` | One JSON line per file: status, completeness, sources, timing |
-| `report_YYYYMMDD_HHMMSS.json` | Full processing report with per-file results |
-
----
-
-## Common Workflows
-
-### First run on a new collection
+| Option | Default | Description |
+|---|---|---|
+| `--bootstrap-venv` | off | Create venv, install deps, re-launch inside it. |
+| `--venv-dir PATH` | `~/.venvs/ebook-pipeline` | Custom venv location. |
+| `--recreate-venv` | off | Destroy and rebuild the venv from scratch. |
 
 ```bash
-# Preview everything first
-python3 do.py /data/ebooks --dry-run --verbose --threads 4
+# First-time setup
+python ebook_metadata_pipeline.py /data/ebooks --bootstrap-venv
 
-# If it looks good, run for real
-python3 do.py /data/ebooks --threads 4
-```
+# Custom venv location
+python ebook_metadata_pipeline.py /data/ebooks --bootstrap-venv --venv-dir /opt/venvs/ebooks
 
-### Re-enrich low-quality files
-
-```bash
-# Check what's in cache
-python3 do.py /data/ebooks --cache-stats
-
-# Reprocess everything, enable AI for files under 70%
-python3 do.py /data/ebooks --force --ai-threshold 0.7 --threads 4
-```
-
-### Offline mode (no network)
-
-```bash
-python3 do.py /data/ebooks --skip-api --skip-ai
-```
-
-### Test on a subset
-
-```bash
-python3 do.py /data/ebooks --limit 10 --dry-run --verbose
+# Rebuild after dependency updates
+python ebook_metadata_pipeline.py /data/ebooks --recreate-venv
 ```
 
 ---
 
-## Configuration File
+### Logging
 
-The pipeline supports a YAML config file that acts as persistent defaults for all CLI flags. CLI flags always override the config file, so you can set your normal workflow in the config and use flags for one-off tweaks.
+| Option | Default | Description |
+|---|---|---|
+| `--log-dir PATH` | `<ebook_dir>/.metadata_logs` | Directory for log files. |
 
-### Config file search order
+The pipeline creates several log files:
 
-1. `--config <path>` (explicit)
-2. `./ebook_pipeline.yaml` (current directory)
-3. `<ebook_dir>/ebook_pipeline.yaml` (alongside your ebooks)
-4. `~/.config/ebook-pipeline/config.yaml` (user config)
-5. `/etc/ebook-pipeline/config.yaml` (system config)
-
-### Priority
-
-```
-CLI flags  >  Environment variables  >  Config file  >  Built-in defaults
-```
-
-### Generate a default config
+| Log File | Contents |
+|---|---|
+| `pipeline.log` | Full timestamped processing log. |
+| `pipeline_stats.jsonl` | One JSON line per file: path, status, score, sources, timing. |
+| `unreadable.log` | Files that couldn't have text extracted, with reasons. |
+| `report.json` | Comprehensive JSON report of all results. |
 
 ```bash
-cp ebook_pipeline.yaml ~/.config/ebook-pipeline/config.yaml
-```
-
-### Example config
-
-```yaml
-# Directories
-ebook_dir: "/mnt/data/ebooks"
-rdf_catalog: "~/gutenberg-rdf"
-
-# API keys (prefer env vars for security)
-anthropic_api_key: null              # use ANTHROPIC_API_KEY env var
-google_api_key: null                 # use GOOGLE_API_KEY env var
-
-# Pipeline stages
-skip_rdf: false
-skip_api: false
-skip_ai: false
-skip_write: false
-skip_rename: false
-
-# Thresholds
-api_threshold: 0.7                   # skip API if completeness >= 70%
-ai_threshold: 0.4                    # skip AI if completeness >= 40%
-
-# Processing
-dry_run: false
-verbose: false
-limit: null                          # null = process all files
-
-# Rate limiting
-rate_limits:
-  openlibrary:
-    delay: 0.5
-    circuit_breaker: 5
-  google_books:
-    delay: 1.5
-    circuit_breaker: 5
-  anthropic:
-    delay: 1.0
-    daily_limit: 500                 # cost control
-  global:
-    files_per_minute: null           # no limit
-    pause_between_files: 0           # seconds between each file
-
-# Scheduling
-schedule:
-  enabled: false
-  calendar: "*-*-* 02:00:00"         # daily at 2 AM
-  max_runtime_minutes: 240
-```
-
-### Config + CLI interaction
-
-```bash
-# Config says verbose: false, but override for this run
-python ebook_metadata_pipeline.py --verbose
-
-# Config says limit: null, but test with 5 files
-python ebook_metadata_pipeline.py --limit 5 --dry-run
-
-# Config says ebook_dir: /mnt/data/ebooks, but process a different dir
-python ebook_metadata_pipeline.py /other/path
-
-# Use a specific config file
-python ebook_metadata_pipeline.py --config /path/to/my-config.yaml
+# Centralized logging
+python ebook_metadata_pipeline.py /data/ebooks --log-dir /var/log/ebook-pipeline
 ```
 
 ---
 
-## Rate Limiting
+## Common Recipes
 
-The pipeline includes configurable rate limiting at two levels: per-API and global file processing speed.
-
-### Per-API Rate Limiting
-
-Each external API has independent controls:
-
-| Setting | OpenLibrary | Google Books | Anthropic | Description |
-|---------|:-----------:|:------------:|:---------:|-------------|
-| `delay` | 0.5s | 1.5s | 1.0s | Minimum time between requests |
-| `max_retries` | 3 | 3 | 2 | Retry count on 429/timeout |
-| `backoff_base` | 2.0 | 2.0 | 3.0 | Exponential backoff multiplier |
-| `circuit_breaker` | 5 | 5 | 3 | Disable after N consecutive 429s |
-| `daily_limit` | — | — | — | Max requests per day |
-
-When an API returns `429 Too Many Requests`, the pipeline automatically backs off exponentially. After N consecutive 429s (the `circuit_breaker` threshold), the API is disabled for the rest of the run and the pipeline falls back to other sources.
-
-### Global File Throttling
-
-Control how fast the pipeline processes files overall:
-
-```yaml
-rate_limits:
-  global:
-    files_per_minute: 30             # process max 30 files/min
-    files_per_hour: 1000             # hard cap per hour
-    pause_between_files: 0.5         # 500ms pause between each file
-```
-
-This is useful when running against a shared filesystem or when you want to limit CPU/IO impact on a production server.
-
-### CLI rate override
+### Full enrichment of a new library
 
 ```bash
-# Quick override for testing
-python ebook_metadata_pipeline.py --rate-delay 2.0 --files-per-minute 10
+export ANTHROPIC_API_KEY="sk-ant-..."
+python ebook_metadata_pipeline.py /data/ebooks \
+  --bootstrap-venv \
+  --auto-download-rdf \
+  --google-api-key AIzaSy... \
+  --verbose
 ```
 
-### Cost control for AI
+### Quick local-only pass (no network, no cost)
 
-Set a daily limit on Anthropic API calls to control costs:
-
-```yaml
-rate_limits:
-  anthropic:
-    daily_limit: 200                 # max 200 AI calls per day
+```bash
+python ebook_metadata_pipeline.py /data/ebooks \
+  --skip-api --skip-ai --skip-rdf
 ```
+
+### Audit-only — see what would change without touching files
+
+```bash
+python ebook_metadata_pipeline.py /data/ebooks --dry-run --verbose
+```
+
+### Process only unhandled files from a previous partial run
+
+```bash
+# The cache automatically skips already-processed files
+python ebook_metadata_pipeline.py /data/ebooks
+```
+
+### Re-process failures only
+
+```bash
+# 1. See what failed
+python ebook_metadata_pipeline.py /data/ebooks --show-problems
+
+# 2. Clear cache and reprocess with more aggressive settings
+python ebook_metadata_pipeline.py /data/ebooks --force --ai-threshold 0.7
+```
+
+### Large library with rate limit protection
+
+```bash
+python ebook_metadata_pipeline.py /data/ebooks \
+  --threads 2 \
+  --google-api-key KEY1 \
+  --google-api-key KEY2 \
+  --google-api-key KEY3 \
+  --max-file-size 500
+```
+
+### Project Gutenberg collection
+
+```bash
+python ebook_metadata_pipeline.py /data/gutenberg-books \
+  --rdf-catalog /data/gutenberg-rdf \
+  --skip-api --skip-ai
+```
+
+The RDF catalog alone provides title, authors, subjects, language, LCC, and
+rights for Gutenberg texts — APIs and AI are unnecessary.
 
 ---
 
-## Automation
+## Decision Logic Detail
 
-The pipeline can be automated via **systemd timer** (preferred on Linux) or **cron**. A service installer script handles the setup.
+### When does the API stage fire?
 
-### Quick setup (systemd user service)
+Only when 2 or more of these fields are missing after embedded + filename:
+subjects/genres, language, description, page count, cover, ISBN, publisher,
+LCC/DDC classification.
 
-```bash
-# Install as a user service (no sudo needed)
-python ebook_pipeline_service.py install --user --config ebook_pipeline.yaml
+### When does the AI stage fire?
 
-# Start the timer
-systemctl --user start ebook-pipeline.timer
+Two conditions (checked independently):
 
-# Check it's running
-systemctl --user list-timers
-```
+1. **Normal mode:** Extracted text exists (>100 chars) AND completeness score
+   is below `--ai-threshold` (default 0.4 = 40%).
+2. **Fallback mode:** Text extraction completely failed (unreadable file) AND
+   the Anthropic API is available. Sends only the filename and file size.
 
-### System-level service (runs as your user)
+### When does metadata get written?
 
-```bash
-sudo python ebook_pipeline_service.py install --config ebook_pipeline.yaml
+All three conditions must be true:
+- `--dry-run` is not set
+- `--skip-write` is not set
+- At least one field has a writable change (new data that the file format
+  can actually store)
 
-# Start
-sudo systemctl start ebook-pipeline.timer
-sudo systemctl status ebook-pipeline.timer
-```
+Writes are also skipped for corrupted or encrypted files even if changes exist.
 
-### Cron alternative
+### What determines "writable" vs "unstorable"?
 
-```bash
-# Generate crontab line
-python ebook_pipeline_service.py cron --config ebook_pipeline.yaml
+Each format has a known set of fields it can store (documented in the companion
+`ebook_format_metadata_reference.md`). For example:
+- EPUB can store title, authors, publisher, date, language, description, ISBN,
+  tags, series, and embedded covers.
+- PDF can store all of those except embedded covers.
+- CBZ/CBR can store nothing (image archives).
 
-# Output:
-# 0 2 * * * /path/to/ebook_pipeline_run.sh >> /var/log/ebook-pipeline/cron.log 2>&1
-```
-
-### What gets installed
-
-```
-~/.config/systemd/user/
-├── ebook-pipeline.service    # oneshot service unit
-└── ebook-pipeline.timer      # timer (default: daily 2 AM)
-
-~/.config/ebook-pipeline/
-├── config.yaml               # your config (if not already present)
-└── env                       # API keys (chmod 600)
-
-<script_dir>/
-└── ebook_pipeline_run.sh     # wrapper with lock file + env loading
-```
-
-### Schedule configuration
-
-Set the schedule in your config file using [systemd calendar format](https://www.freedesktop.org/software/systemd/man/systemd.time.html):
-
-```yaml
-schedule:
-  calendar: "*-*-* 02:00:00"         # daily at 2 AM
-  # calendar: "Mon *-*-* 02:00:00"   # weekly on Monday
-  # calendar: "*-*-* *:00:00"        # every hour
-  # calendar: "*-*-* 02,14:00:00"    # twice daily
-  max_runtime_minutes: 240            # stop after 4 hours
-  randomized_delay_sec: 300           # jitter to avoid API storms
-```
-
-### Service management commands
-
-```bash
-# Manual trigger
-systemctl --user start ebook-pipeline.service
-
-# View logs
-journalctl --user -u ebook-pipeline -f
-
-# Disable
-systemctl --user stop ebook-pipeline.timer
-systemctl --user disable ebook-pipeline.timer
-
-# Uninstall completely
-python ebook_pipeline_service.py uninstall --user
-```
-
-### Lock file safety
-
-The wrapper script uses a lock file (`/tmp/ebook-pipeline.lock`) to prevent concurrent runs. If the timer fires while a previous run is still going, it exits cleanly. Stale lock files from crashed runs are automatically detected and cleaned up.
-
-### Environment file for API keys
-
-Store API keys securely in `~/.config/ebook-pipeline/env`:
-
-```bash
-ANTHROPIC_API_KEY=sk-ant-...
-GOOGLE_API_KEY=AIza...
-```
-
-This file is loaded by the wrapper before running the pipeline and should be `chmod 600`.
+If the API returns page count (no ebook format stores this) or LCC
+classification codes, those appear under "API FOUND" instead of "CHANGES" and
+are saved to the cache but not written to the file.
 
 ---
 
-## Project Files
+## Readability Statuses
 
-| File | Purpose |
-|------|---------|
-| `ebook_metadata_pipeline.py` | Main pipeline script |
-| `ebook_pipeline.yaml` | Configuration template |
-| `ebook_pipeline_config.py` | Config loader + rate limiter |
-| `ebook_pipeline_service.py` | Systemd/cron service installer |
-| `ebook_pipeline_run.sh` | Generated wrapper script (auto-created) |
-| `setup.sh` | One-shot dependency installer |
-| `README.md` | This file |
-
----
-
-## Dependencies
-
-| Package | Purpose | Install |
-|---------|---------|---------|
-| `ebooklib` | EPUB reading/writing | `pip install ebooklib` |
-| `PyMuPDF` (fitz) | PDF metadata + text extraction | `pip install PyMuPDF` |
-| `lxml` | XML parsing | `pip install lxml` |
-| `requests` | HTTP for API calls | `pip install requests` |
-| `anthropic` | Claude AI API client | `pip install anthropic` |
-| `mobi` | MOBI/AZW extraction | `pip install mobi` |
-| `beautifulsoup4` | HTML text extraction | `pip install beautifulsoup4` |
-| `pyyaml` | Config file parsing | `pip install pyyaml` |
-| **Calibre** | `ebook-meta` CLI for reading/writing metadata | `sudo apt install calibre` |
-
-```bash
-# Install all Python deps at once
-pip install ebooklib PyMuPDF lxml requests anthropic mobi beautifulsoup4 pyyaml --break-system-packages
-```
-
----
-
-## License
-
-MIT
+| Status | Icon | Meaning |
+|---|---|---|
+| `readable` | ✓ | Text successfully extracted. |
+| `encrypted` | 🔒 | DRM or password protection detected. |
+| `corrupted` | ✗ | File is damaged or empty. |
+| `scanned-image-only` | 📷 | PDF contains only images (no OCR text layer). |
+| `ai-recovered` | 🤖 | Text extraction failed but AI identified the book from filename. |
+| `unreadable` | ✗ | All extraction methods failed. |
+| `no-text` | ⚠ | File opened but contained no extractable text. |
